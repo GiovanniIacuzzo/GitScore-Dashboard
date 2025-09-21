@@ -250,3 +250,96 @@ def scrape_with_ml():
     except Exception as e:
         logger.exception("[ML-SCRAPE] Errore generale:")
         return jsonify({"success": False, "error": str(e)}), 500
+
+@scraper_bp.route("/scrape_top_users_ml", methods=["POST"])
+def scrape_top_users_ml():
+    try:
+        requested_limit = int(request.args.get("limit", 5))
+        logger.info(f"[ML-TOP] Avvio scraping utenti promettenti (limit={requested_limit})")
+
+        # Caricamento modello
+        try:
+            model = joblib.load("models/github_user_classifier.pkl")
+            logger.info("✅ Modello ML caricato.")
+        except FileNotFoundError:
+            return jsonify({"success": False, "error": "Modello ML non trovato."}), 500
+
+        # Raccolta candidati
+        candidate_usernames = set()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(get_followers_or_following, ku, typ)
+                       for ku in KEY_USERS for typ in ["followers", "following"]]
+            for future in as_completed(futures):
+                try:
+                    candidate_usernames.update(future.result())
+                except Exception as exc:
+                    logger.warning(f"[ML-TOP] Errore recupero candidati: {exc}")
+
+        # Filtra già annotati
+        existing = {u["username"] for u in collection.find({"annotation": {"$exists": True}}, {"username": 1})}
+        candidate_usernames = [u for u in candidate_usernames if u not in existing]
+
+        if not candidate_usernames:
+            return jsonify({"success": False, "error": "Nessun candidato disponibile."}), 200
+
+        # Batch processing
+        batch_size = 50
+        top_users = []
+
+        while candidate_usernames and len(top_users) < requested_limit:
+            users_to_fetch = [candidate_usernames.pop(0) for _ in range(min(batch_size, len(candidate_usernames)))]
+            batch_user_docs = []
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_user = {executor.submit(get_user_info_cached, u): u for u in users_to_fetch}
+                for future in as_completed(future_to_user):
+                    username = future_to_user[future]
+                    info = future.result()
+                    if not info or info.get("public_repos", 0) < 5 or info.get("type") != "User":
+                        continue
+                    doc = {
+                        "username": username,
+                        "followers": info.get("followers", 0),
+                        "following": info.get("following", 0),
+                        "public_repos": info.get("public_repos", 0),
+                        "bio": info.get("bio", ""),
+                        "location": info.get("location", ""),
+                        "email_to_notify": extract_email_from_github_profile(username)
+                    }
+                    batch_user_docs.append(doc)
+
+            if not batch_user_docs:
+                continue
+
+            # DataFrame features
+            df_batch = pd.DataFrame([extract_features(doc) for doc in batch_user_docs])
+            for c in NUM_FEATURES + CAT_FEATURES + [TEXT_FEATURE]:
+                if c not in df_batch.columns:
+                    df_batch[c] = "" if c in CAT_FEATURES + [TEXT_FEATURE] else 0
+            df_batch = df_batch[NUM_FEATURES + CAT_FEATURES + [TEXT_FEATURE]]
+
+            probs_array = model.predict_proba(df_batch)
+            probs = probs_array[:, 1] if probs_array.shape[1] > 1 else probs_array[:, 0]
+
+            # Ordina per probabilità decrescente
+            for i, doc in enumerate(batch_user_docs):
+                doc["pred_prob"] = float(probs[i])
+            batch_user_docs.sort(key=lambda x: x["pred_prob"], reverse=True)
+
+            # Aggiungi solo fino a requested_limit
+            remaining = requested_limit - len(top_users)
+            if remaining <= 0:
+                break
+            top_users.extend(batch_user_docs[:remaining])
+
+            # Salva su DB
+            for doc in batch_user_docs:
+                collection.update_one({"username": doc["username"]}, {"$set": doc}, upsert=True)
+
+        # Sicurezza: limita rigidamente a requested_limit
+        top_users = top_users[:requested_limit]
+
+        return jsonify({"success": True, "users": top_users, "inserted": len(top_users)}), 200
+
+    except Exception as e:
+        logger.exception("[ML-TOP] Errore:")
+        return jsonify({"success": False, "error": str(e)}), 500

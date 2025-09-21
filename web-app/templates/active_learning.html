@@ -28,6 +28,7 @@
     <div class="input-group mb-3">
         <input type="number" id="ml-limit" class="form-control" placeholder="Numero utenti da cercare" value="5" min="1">
         <button class="btn btn-warning" onclick="scrapeWithML()">🤖 Scraping con Modello ML</button>
+        <button class="btn btn-primary" onclick="scrapeTopUsersWithML()">⭐ Suggerisci utenti promettenti</button>
     </div>
 
     <!-- Tabella utenti estratti -->
@@ -138,6 +139,61 @@ document.addEventListener("DOMContentLoaded", function() {
             if (data.success) {
                 alert(`✅ Scraping completato, ${data.inserted} utenti validi trovati`);
                 loadUncertain();
+            } else {
+                alert("Errore: " + (data.error || "Unknown"));
+            }
+        } catch (err) {
+            alert("Errore rete: " + err);
+        }
+    };
+
+    window.scrapeTopUsersWithML = async function() {
+        try {
+            const limitInput = document.getElementById("ml-limit");
+            const limit = limitInput ? parseInt(limitInput.value) || 5 : 5;
+
+            const resp = await fetch(`/scrape_top_users_ml?limit=${limit}`, { method: "POST" });
+            const data = await resp.json();
+
+            if (data.success) {
+                const tbody = document.getElementById("uncertain-tbody");
+                tbody.innerHTML = ""; // pulisce la tabella
+
+                if (!data.users.length) {
+                    tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted">Nessun utente trovato</td></tr>`;
+                    return;
+                }
+
+                data.users.forEach(user => {
+                    const row = document.createElement("tr");
+                    row.innerHTML = `
+                        <td><a href="https://github.com/${user.username}" target="_blank">${user.username}</a></td>
+                        <td>${user.bio || "-"}</td>
+                        <td>${user.location || "-"}</td>
+                        <td>${user.followers || 0}</td>
+                        <td>${user.following || 0}</td>
+                        <td><span class="badge bg-success badge-prob">${user.pred_prob || 0}</span></td>
+                        <td class="annotation-btns"></td>
+                    `;
+                    const td = row.querySelector(".annotation-btns");
+
+                    const btnYes = document.createElement("button");
+                    btnYes.className = "btn btn-sm btn-success";
+                    btnYes.textContent = "👍 Promettente";
+                    btnYes.addEventListener("click", () => window.saveAnnotation(user.username, 1));
+
+                    const btnNo = document.createElement("button");
+                    btnNo.className = "btn btn-sm btn-danger";
+                    btnNo.textContent = "👎 Non valido";
+                    btnNo.addEventListener("click", () => window.saveAnnotation(user.username, 0));
+
+                    td.appendChild(btnYes);
+                    td.appendChild(btnNo);
+
+                    tbody.appendChild(row);
+                });
+
+                alert(`✅ Trovati ${data.inserted} utenti promettenti`);
             } else {
                 alert("Errore: " + (data.error || "Unknown"));
             }
